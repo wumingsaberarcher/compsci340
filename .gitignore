@@ -3,3 +3,7 @@
 *.tmp
 Thumbs.db
 desktop.ini
+
+# xv6-rust build artifacts and Canvas zip
+xv6-rust-student/target/
+*.zip
