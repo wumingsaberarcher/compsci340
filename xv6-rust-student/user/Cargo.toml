@@ -135,6 +135,13 @@ doctest = false
 bench = false
 
 [[bin]]
+name = "a2check"
+path = "bin/a2check.rs"
+test = false
+doctest = false
+bench = false
+
+[[bin]]
 name = "testrunner"
 path = "testbin/testrunner.rs"
 test = false

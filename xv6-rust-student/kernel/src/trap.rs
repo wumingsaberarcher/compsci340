@@ -64,10 +64,13 @@ pub unsafe fn usertrap() {
             // page fault on lazily-allocated page, a protected page, or a null pointer
             scause::Trap::Exception(scause::Exception::StorePageFault)
             | scause::Trap::Exception(scause::Exception::LoadPageFault)
-            | scause::Trap::Exception(scause::Exception::InstructionPageFault) => {
+            | scause::Trap::Exception(scause::Exception::InstructionPageFault)
+            | scause::Trap::Exception(scause::Exception::LoadAccessFault)
+            | scause::Trap::Exception(scause::Exception::StoreAccessFault)
+            | scause::Trap::Exception(scause::Exception::InstructionAccessFault) => {
                 let stval = stval::read();
-                // vmfault handles the page fault
-                // if err, either out-of-memory, out-of-bound, or a null dereference
+                // vmfault handles lazy / COW faults. If it fails, this is a real
+                // memory error — print a readable message for a null dereference.
                 if log!(pagetable.vmfault(VA::from(stval))).is_err() {
                     if stval < PGSIZE {
                         println!("Segmentation Fault!");
@@ -86,6 +89,13 @@ pub unsafe fn usertrap() {
                     }
                     proc.inner.lock().killed = true;
                 }
+            }
+
+            // Release builds may lower `*null` to an illegal instruction (`unimp`).
+            // That still means the user tried to dereference a null pointer.
+            scause::Trap::Exception(scause::Exception::IllegalInstruction) => {
+                println!("Segmentation Fault!");
+                proc.inner.lock().killed = true;
             }
 
             // device interrupt
