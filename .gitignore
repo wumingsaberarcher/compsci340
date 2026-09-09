@@ -1,0 +1,5 @@
+# Office lock files and Windows junk — keep course PDFs
+~$*
+*.tmp
+Thumbs.db
+desktop.ini

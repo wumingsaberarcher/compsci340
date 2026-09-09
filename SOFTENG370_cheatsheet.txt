@@ -1,0 +1,528 @@
+================================================================================
+SOFTENG 370 / COMPSCI 340  期中 Cheatsheet
+来源：2025/2026 试卷、Lecture 1–13、Piazza、个人错题
+版本：2026-08-27
+考试：闭卷，1 张双面 A4，无计算器，选 BEST answer
+================================================================================
+
+目录
+  A. 专有名词 / 缩写
+  B. 总体框架（三次课的主线）
+  C. 进程、fork/exec/wait、管道、系统调用
+  D. 调度
+  E. 虚拟内存、页表、TLB、EAT
+  F. 缺页置换
+  G. 内存分配器（heap / buddy / slab / malloc）
+  H. 用户态 / 内核态、中断、上下文切换
+  I. C 语言考点（对齐、缓冲、sizeof）
+  J. 2025 试卷参考答案 + 错题
+  K. 2026 已讨论题
+  L. 考场速算模板
+
+
+================================================================================
+A. 专有名词 / 缩写
+================================================================================
+
+ABI          Application Binary Interface，二进制接口（调用约定、寄存器、系统调用号）
+API          Application Programming Interface，源码级接口
+COW          Copy-On-Write，写时复制
+CPU          Central Processing Unit
+CFS          Completely Fair Scheduler（Linux，按 vruntime 选最“亏”的任务）
+DMA          Direct Memory Access，设备不经 CPU 直接读写内存
+EAT          Expected / Effective Access Time，有效访存时间
+EEVDF        Earliest Eligible Virtual Deadline First（Linux 6.6+ 替代 CFS）
+FCFS         First Come First Served，先来先服务（非抢占）
+FIFO         First In First Out（调度或页面置换）
+IPC          Inter-Process Communication（pipe、signal、共享内存等）
+LRU          Least Recently Used，最久未使用
+MLFQ         Multi-Level Feedback Queue，多级反馈队列
+MMU          Memory Management Unit，把 VA 翻译成 PA
+OOM          Out Of Memory（killer 会杀进程）
+PA / PPN     Physical Address / Physical Page Number
+PTE          Page Table Entry，页表项
+RR           Round Robin，时间片轮转
+SJF          Shortest Job First，最短作业优先（非抢占，要知道 burst）
+SRTF         Shortest Remaining Time First = SJF 的抢占版
+     也叫 Shortest Job-to-Completion First
+TLB          Translation Lookaside Buffer，VPN→PPN 快表
+VA / VPN     Virtual Address / Virtual Page Number
+vruntime     CFS 的虚拟运行时间
+xv6          教学用 Unix，本课实验系统
+
+进程相关
+  PCB / proc   进程控制块（PID、状态、页表指针、打开文件、调度信息）
+  PID          Process ID
+  zombie       已 exit、父进程还没 wait，PCB 还在
+  orphan       父进程先死，子进程被 init 收养
+  trap         同步陷入（syscall、fault、例外），当前指令引发
+  interrupt    异步中断（时钟、设备），与当前指令无关
+
+内存相关
+  page / frame 页（虚拟） / 帧（物理），大小相同
+  offset       页内偏移，翻译时原样拷贝
+  demand paging 第一次访问才配物理页
+  overcommit   malloc/mmap 可先成功，真正写时才可能没物理页
+  external fragmentation 外部碎片：空闲块够总大小但都不连续
+  internal fragmentation 内部碎片：分给你的块比请求大
+  working set  最近真正在用的那一组页
+
+文件 / 系统调用（xv6 / POSIX）
+  fork()    复制当前进程，父返 PID，子返 0
+  exec()/execl()/execve()  用新程序替换当前地址空间，成功不返回
+  wait()    等子进程结束并收尸，消除 zombie
+  exit()    结束自己，变成 zombie 直到被 wait
+  pipe()    内核建管道，返回两个 fd（读端、写端）
+  open/read/write/close
+  brk/sbrk  移动堆顶（program break）
+  mmap      映射一段虚拟内存（大块 malloc 常用）
+  uptime    xv6：开机以来的 tick 数（约 0.1s/tick）
+
+
+================================================================================
+B. 总体框架
+================================================================================
+
+三根主线
+  Virtualization  给每个程序一份“好像独占”的 CPU / 内存视图
+  Concurrency     多个活动在同一份硬件上交替前进
+  Persistence     机器/进程停了数据还在（文件、磁盘）
+
+一次请求可能穿过
+  应用程序 → 库（malloc/printf/read 包装）→ 内核（syscall）→ 硬件（MMU/设备/时钟）
+
+不一定进内核的例子
+  strlen()           纯用户态
+  malloc() 小请求    堆里已有空闲块时不进内核
+  普通 load/store    只走 MMU/TLB，命中就不 trap
+
+一定进内核
+  read/write/open/fork/exec/pipe/sbrk（堆要扩张时）
+  缺页、保护错、系统调用、时钟中断
+
+三个复盘问题（Lecture 13）
+  1. 跨了哪条边界？（函数调用 / trap / IPC / VA→PA）
+  2. 哪块状态变了？（Running→Blocked，旧程序→新程序，页变驻留）
+  3. 谁被用了或转走了？（CPU、物理帧、fd、管道字节、子进程退出码）
+
+
+================================================================================
+C. 进程、fork / exec / wait、管道
+================================================================================
+
+程序 vs 进程
+  程序：文件里的指令+静态数据，还没跑
+  进程：正在跑的程序 + 寄存器 + 地址空间 + 内核资源/权限
+
+fork 之后（现代 COW 系统，课上口径）
+  (1) 各自一份页表          FALSE（一般不共享页表本身）
+  (2) 共享虚拟内存          FALSE（两套地址空间，布局可以相同）
+  (3) 共享物理页            TRUE（直到某一方写入，才真正拷贝）
+  2025 Q16 答案：D  假、假、真
+
+exec
+  在【子进程】里调用，替换【自己的】地址空间
+  成功：后面的代码不会执行
+  2025 Q7 = C；Q2 / Q12 都考“execl 成功则后面的 fork/printf 作废”
+
+wait / exit / zombie
+  子进程 exit 后立刻变 zombie，直到父进程 wait
+  不是立刻从进程表消失，也还不是 orphan
+  2025 Q5 = E
+
+管道 pipe（xv6）
+  用户调用 pipe → trap 进内核 → 识别 syscall 号 → sys_pipe
+  内核分配 pipe 缓冲，返回两个 fd
+  不是用户态自己映射共享页，也不是等两端都 open 才返回
+  2025 Q1 = A
+
+fork 个数口算
+  每个成功的 fork 把“当前这条执行流”一分为二
+  注意：
+    - if (fork())  父进分支，子不进
+    - if (!fork()) 子进分支
+    - || 和 && 会短路，另一边的 fork 可能根本不执行
+    - exec 成功后后面的 fork 不存在
+
+2025 Q29
+  if (fork() || fork())
+      fork();
+  print("1");
+  短路：父进程左边已真，不再做第二个 fork，但会做第三个
+  第一个子进程左边为假，必须做第二个 fork，再做第三个
+  第二个 fork 产生的那个孙子条件为假，不再做第三个
+  共 5 个进程，输出 11111  → D
+
+忙等 sleep（2025 Q3）
+  while (uptime() - start < ticks);
+  时间能等到（uptime 是 syscall，tick 照样加）
+  但进程一直 Running，浪费 CPU
+  真正的 sleep() 会把进程 Blocked，不占 CPU
+  答案 B，不是 A
+
+上下文切换
+  (1) 必须在内核态          TRUE
+  (2) 只能发生在处理完中断后  FALSE（syscall、主动 yield、阻塞也能切）
+  (3) 用户进程 syscall 一定 user→kernel  TRUE
+  2025 Q15 = D
+
+
+================================================================================
+D. 调度
+================================================================================
+
+非抢占 vs 抢占
+  非抢占：只有进程自己结束/阻塞/yield 才让出 CPU（FCFS、SJF）
+  抢占：OS 可强制切走（RR 时间片到、SRTF 来了更短的、时钟中断）
+  真正抢占需要【定时器硬件】，没有 timer 做不到 involuntary switch
+  时间片越小 → 切换越频繁 → 开销越大（不是越小）
+
+平局
+  题目写 Use FCFS for all tiebreaks → 到达更早的优先
+  “P4 arrives after P3” 即使同一时刻也是 P3 先入队
+
+2025 Q23–27 数据
+  P1 arr=0 burst=4
+  P2 arr=1 burst=6
+  P3 arr=2 burst=2
+  P4 arr=2（在 P3 之后）burst=1
+
+FCFS   完成：P1=4, P2=10, P3=12, P4=13     → C
+SJF    t=0 只有 P1；t=4 选最短 P4→P3→P2
+       完成：P1=4, P2=13, P3=7, P4=5       → A
+SRTF   t=2 时 P1 剩余 2，P4 剩余 1，抢占
+       完成：P1=5, P2=13, P3=7, P4=3       → D
+RR q=3 完成：P1=10, P2=13, P3=8, P4=9      → D
+
+周转时间 TAT = 完成时间 − 到达时间
+  FCFS avg 8.5
+  SJF  avg 6
+  SRTF avg 5.75   ← 最短  → 2025 Q27 = A
+  RR   avg 8.75
+
+响应时间 / 等待时间
+  等待时间 = TAT − burst
+  平均等待时间最短通常也是 SRTF（在知道剩余时间的前提下）
+
+MLFQ（多级反馈队列）
+  规则：
+    1. 先跑当前最高非空队列
+    2. 同队列 RR
+    3. 在某一层把【配额 allotment】用完 → 降到下一层
+    4. 每隔周期 S，所有就绪进程 boost 回最高层，配额重置
+  两个时间不要混：
+    quantum   = 这一层 RR 切片，到点换人，不一定降级
+    allotment = 这一层累计可用 CPU，用完才降级
+  累计：中途 block / yield 不会把配额清零（防 gaming）
+  Boost 后 CPU-bound 进程会【再次一层层降下去】
+  Piazza：课件示意图 boost 后黑块连跑 3 倍配额还不降，是画错了
+  Talia：应 reset 后再 gradually downgrade
+
+MLFQ 要解决的两个问题
+  饥饿 starvation：高层不断来新活，低层永远跑不到 → 用 periodic boost
+  作弊 gaming：快用完配额就 yield，想赖在高层 → 配额跨 turn 累计
+
+CFS / EEVDF（了解口径）
+  CFS：选 vruntime 最小的；权重大的真实时间可以跑更久才赶上
+  EEVDF：lag≥0 才 eligible，再选虚拟截止时间最早的
+
+
+================================================================================
+E. 虚拟内存、页表、TLB、EAT
+================================================================================
+
+地址切分
+  VA = VPN + offset
+  offset 位数 = log2(page size)
+  页号 = VA // page_size = VA >> offset_bits
+  翻译后：PA = PPN || offset     （offset 原样保留）
+
+2025 Q14
+  24-bit 地址 0x789ABC，页 128 B = 2^7
+  页号 = 0x789ABC >> 7 = 0xF135
+  选项里没有 → B None
+  陷阱：不要取高字节 0x78，也不要当 offset 是整数字节
+
+单级页表 PTE 数 = 2^(VPN位数) = 2^(VA位数 − offset位数)
+
+多级页表
+  每张页表必须塞进一页
+  每级入口数 = page_size / PTE_size
+  每级索引位数 = log2(入口数)
+  最少层数 = ceil(VPN位数 / 每级索引位数)
+
+2025 Q18–20
+  25-bit VA，40-bit PA，页 128 B，PTE 1 B
+  offset=7，VPN=18
+  单级 PTE 数 = 2^18                → D
+  每级 128 项 → 7 位索引，ceil(18/7)=3 级 → E
+  130 个数据页：
+    叶表每页 128 项 → 至少 2 张 L0
+    再加 1 张中间 + 1 张根 = 3 张页表
+    总共 130+3=133 页               → D
+
+2026 Q20–23 口径（30-bit VA，页 512 B，PTE 8 B）
+  offset=9，VPN=21
+  每页 512/8=64 项 → 6 位/级
+  4 级：3 | 6 | 6 | 6 | 9
+  每张页表大小 = 一帧 = 512 B
+  问“page table 已分配多少字节”：只数页表页，不数数据页
+
+  三个地址 0x08418812, 0x08418A1A, 0x0842021F
+    切分后 L3、L2 相同
+    前两个：同一张 L1、同一张 L0（不同 L0 项）
+    第三个：同一张 L1 的另一个项 → 多一张 L0
+  页表页：1 L3 + 1 L2 + 1 L1 + 2 L0 = 5
+  5 × 512 = 2560 B → D
+  L0 是页表不是数据，必须计入
+
+TLB
+  缓存 VPN→PPN
+  TLB miss ≠ page fault
+    miss：翻译不在快表，要走页表；页可能已在内存
+    fault：PTE 说页不在 RAM / 无权限，要进内核
+  多级 vs 单级：不【天生】改变 TLB miss rate
+    （TLB 看的是 VPN→PPN，不看中间走几级）
+  x86：谁被换出去由 OS 策略决定
+  load/store 只有 fault/保护错才 trap，不是每次都进内核
+  2025 Q6 四句全对 → E
+
+EAT 模板
+  先写清：命中花多少，缺失花多少（几级页表就要几次内存）
+
+  2025 Q4（2 级页表）
+    旧：TLB 时间≈0，hit=25%
+      命中 1 次内存，缺失 3 次内存（2 次页表 + 数据）
+      EAT_old = 0.25×1M + 0.75×3M = 2.5M
+    新：hit=50%，但 TLB 时间 = M
+      命中 2M，缺失 4M
+      EAT_new = 0.5×2M + 0.5×4M = 3M
+      改善 = (2.5−3)/2.5 = −20% → E
+
+  2025 Q17
+    TLB=5，内存=75，找 PTE=100，无缺页
+    命中 5+75=80
+    缺失 5+100+75=180
+    80h + 180(1−h) ≤ 90  →  h ≥ 0.9 → C
+
+为什么要多级
+  单级页表必须给整个 VPN 空间留 PTE，稀疏地址空间极浪费
+  多级：没用到的高位项下面根本不建子表
+
+
+================================================================================
+F. 缺页置换
+================================================================================
+
+三种算法（物理帧数固定，页一开始都在盘上）
+
+Optimal（MIN / Belady）
+  换“未来最久才会再用”的页；需要预知未来；缺页下界
+
+FIFO
+  队列：谁最早进来谁先走
+  与最近用没用无关；可能有 Belady 异常（帧变多缺页更多）
+
+LRU
+  换“最久没被访问”的页
+  用栈/计时近似；比 FIFO 准，比 Optimal 可实现
+
+Clock（第二次机会）
+  环形扫描，看 reference bit
+  bit=1：清 0，给第二次机会
+  bit=0：换掉
+  比 FIFO 好，比精确 LRU 便宜
+  实时+低开销场景：继续用 Clock，调 reference bit 复位频率
+  2025 Q9 = B
+  不要选 Optimal（现实没有未来知识）
+  不要为了少缺页去上全量 LRU（开销大）
+
+2025 Q21 序列 1 2 3 1 2 4 1 2 3，3 帧
+  Optimal 5，FIFO 7，LRU 5 → D
+  注意 LRU 在换入 4 时换的是 3，最后 3 再缺一次，一共 5 不是 6
+
+
+================================================================================
+G. 内存分配器
+================================================================================
+
+三层（不要混）
+  用户堆分配器   malloc/free，变长块，header + free list + split/coalesce
+  Buddy          管物理页块，2^order 页，分裂/合并兄弟
+  Slab           在 buddy 给的页上切固定大小 slot，给内核小对象
+
+Fit
+  First Fit  从头找第一个够大的，通常最快；前面容易堆小洞
+  Best Fit   找最小能放下的，剩很多碎渣，外部碎片重，还要多搜
+  Worst Fit  找最大块；要扫全表或维护按大小排序（排序本身有成本）
+  Piazza Q11：Talia「谁来排序？排序有没有成本？」
+    → “一开始更快”指 First Fit，不是 Worst Fit
+    2025 Q11 = E First Fit
+
+malloc 行为（2025 Q28 + 2026 Q29）
+  malloc 成功（非 NULL）保证的是【虚拟地址可用】
+  不保证：
+    (1) 整块物理页已经配好          → 假（demand paging）
+    (2) 写块内每个字节一定成功      → 假（overcommit / OOM）
+    (3) 进程死后还占着直到 free     → 假（退出内核回收全部）
+  2026 Q29 = D 三句全假
+
+  一次 malloc(1) 可能发生的事：
+    堆里已有空间 → 纯用户态，连 sbrk 都没有
+    堆不够       → sbrk/brk 扩虚拟堆
+    很大一块     → mmap
+    物理页、置换 → 通常第一次写时才发生，题目没说内存满就不要默认走置换
+  2025 Q28 最稳 = D 只有 (1) sbrk
+    （若选项语境把“第一次访问”也算进去，才可能出现 (3)）
+
+free
+  只把块还回【这个进程的】分配器
+  进程终止 ≠ 需要 free；内核拆掉整个地址空间
+
+
+================================================================================
+H. 用户态 / 内核态、中断、保护
+================================================================================
+
+为什么要分两态
+  阻止用户程序执行特权指令
+  把用户程序和关键系统操作隔开
+  不是为了“让所有程序直接碰硬件”
+  也不是“OS 不能访问用户内存”（OS 必须能 copyin/copyout）
+  2025 Q22：B、D 对；C、E 错；A“全选”按理不成立（题出得差）
+
+硬件提供的钩子
+  CPU 特权级 + trap     → 受控进入内核、系统调用、保护
+  Timer                 → 抢占式调度
+  MMU + TLB             → 每进程虚拟地址空间
+  设备控制器 + 中断/DMA → 文件、管道、磁盘
+  多核                   → 真正并行
+
+Context switch vs fork vs exec vs page fault
+  fork          新进程身份
+  成功 exec     当前进程换了程序
+  context switch 换谁占用 CPU
+  demand-page fault  一个合法映射变成驻留
+
+
+================================================================================
+I. C 语言考点
+================================================================================
+
+结构体对齐（常见 LP64 / 4 或 8 字节对齐，int=4）
+  每个成员对齐到自己的对齐要求，结构体总大小对齐到最大成员
+  2025 Q10
+    char a; int b; char c; int d;
+    a(1)+pad3 + b(4) + c(1)+pad3 + d(4) = 16 → B
+  2026 Q25 同类：char,char,int,char,int,char 自己画 padding
+
+printf vs write
+  printf 走用户态缓冲（stdout 全缓冲或行缓冲）
+  write  直接 syscall，立刻出
+  2025 Q8：
+    printf("Hello"); write(...,"World",5); printf("Again");
+    输出 WorldHelloAgain → B
+
+execl + printf
+  execl 成功不返回，printf 不到 → 只看到 echo 的输出
+
+
+================================================================================
+J. 2025 试卷参考答案 + 个人错题
+================================================================================
+
+题号 答案   备注
+ 1    A     pipe：trap → sys_pipe
+ 2    B     execl 吃掉后面的 fork，剩 2 个进程
+ 3    B     忙等能睡够，但占 CPU     ★易错（不是 A）
+ 4    E     EAT 变差 −20%
+ 5    E     exit 后是 zombie          ★易错（不是立刻消失）
+ 6    E     四句都真
+ 7    C     子进程 exec 自己
+ 8    B     WorldHelloAgain
+ 9    B     调 Clock，不要 Ideal LRU / Optimal
+10    B     sizeof=16
+11    E     First Fit                 ★改过（不是 Worst Fit）
+12    D     只打印 2
+13    B     10 10 3 3（父 wait，顺序确定）
+14    B     页号 0xF135，选项没有     ★易错
+15    D     真假真
+16    D     COW：假假真              ★易错
+17    C     hit ≥ 0.9                ★易错
+18    D     2^18                     ★易错
+19    E     3 级
+20    D     133 页                   ★易错
+21    D     5,7,5                    ★易错（LRU 不是 6）
+22    争议  严格不是 A；正确理由是 B 和 D
+23    C     FCFS 4,10,12,13
+24    A     SJF  4,13,7,5
+25    D     SRTF 5,13,7,3
+26    D     RR3  10,13,8,9
+27    A     SRTF TAT 最短
+28    D     malloc(1) 最常只 sbrk     ★易错
+29    D     11111                    ★易错（短路）
+30    B     时间片到 → 强制切换
+31    Bonus 忽略
+
+再做时重点盯带 ★ 的题。
+
+
+================================================================================
+K. 2026 已讨论题（补充）
+================================================================================
+
+Q23  三个地址的多级页表字节数
+     1+1+1+2 张页表 × 512 = 2560 → D
+     必数 L0，不要数 data pages
+
+Q29  malloc 三句陈述全假 → D
+     Talia 说课上没把这三条“保证”讲死，但按原理就是 D
+
+
+================================================================================
+L. 考场速算模板
+================================================================================
+
+1) 页号
+   offset_bits = log2(page_size)
+   VPN = address >> offset_bits
+   用十六进制时先写成二进制再切，不要按“看起来整齐的字节”切
+
+2) 多级层数
+   entries = page_size / PTE_size
+   bits_per_level = log2(entries)
+   levels = ceil(VPN_bits / bits_per_level)
+   每张表都占满一页，即使只用了几个入口
+
+3) “最少页表页”
+   只为【已映射数据页】建从根到叶的路径
+   同一条路径上的表能共用就共用
+   总数 = 数据页 + 沿途所有不同的页表页
+
+4) EAT
+   命中代价 = TLB + 1 次数据
+   缺失代价 = TLB + (#levels 次页表) + 数据    （无缺页时）
+   有缺页再加处理时间（题目给才加）
+
+5) 调度甘特图
+   先标到达
+   非抢占：每次在就绪里挑，跑完再挑
+   抢占：每个到达点/时间片边界重新比
+   平局 FCFS：先到或先入队的赢
+   TAT = finish − arrival
+
+6) fork 树
+   画出每个进程对每个 fork 的返回值
+   遇到 || / && 先看左边，真/假决定右边做不做
+   exec 成功 = 这棵子树后面的语句全部砍掉
+
+7) 置换
+   画一张“帧内容 + 谁是受害者”表
+   Optimal 看未来第一次出现的最远
+   FIFO 看进入顺序
+   LRU 看最近一次使用时间
+   第一遍填满帧的每次都算缺页
+
+================================================================================
+完
+================================================================================

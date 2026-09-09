@@ -1,0 +1,538 @@
+COMPSCI 340 速查表
+范围：本次对话覆盖的知识点 + 对应错题 + 专有名词/缩写
+课程：2026 S2 Operating Systems（Talia Xu）
+整理日期：2026-08-27
+============================================================
+
+【怎么用这份表】
+- 先看「一句话定义」，再看「易错点」
+- 错题部分给出结论和为什么不能选别的
+- 英文专有名词保留原文，方便对试卷
+
+
+============================================================
+0. 课程三条主线（Lecture 1–2）
+============================================================
+
+Virtualization（虚拟化）
+  给每个程序一份更简单的「独占硬件」视图。
+  CPU → 进程；Memory → 私有地址空间；设备 → 命名资源。
+
+Concurrency（并发）
+  多个活动在同一份资源上都能往前推进（调度、切换）。
+
+Persistence（持久化）
+  程序或机器停了，数据还在（文件、磁盘）。
+
+Process（进程）= 正在运行的程序 + 状态
+  Program：文件里的指令和静态数据，还没在跑。
+  Process：寄存器、内存、OS 管理的资源和权限。
+
+要暂停/恢复一个进程，OS 必须保存：
+  - 寄存器和 PC（program counter）
+  - 栈、堆、代码、数据
+  - 打开的资源和其他 metadata
+
+
+============================================================
+1. C 指针、栈、堆（对话开头那张代码）
+============================================================
+
+1.1 符号
+
+  &   address-of，取地址
+      &z  = 变量 z 在（虚拟）内存里的地址
+
+  *   两种完全不同的用法
+      声明：int *p;     p 是「指向 int 的指针」
+      表达式：*p        解引用 dereference，取该地址上的值
+
+  关系（z 还活着时）：
+      p  == &z
+      *p == z
+
+1.2 经典错误：返回局部变量地址（dangling pointer）
+
+  int *make(void) {
+      int z = 11;     // z 在栈上，函数返回后栈帧失效
+      int *p = &z;
+      return p;       // 把已死变量的地址交出去
+  }
+
+  之后 *q 是未定义行为（可能是 11、垃圾、或崩溃）。
+  栈由函数调用自动管理，生命周期跟函数走。
+
+1.3 malloc(sizeof(int))
+
+  sizeof(int)  : 一个 int 占多少字节（常见 4）
+  malloc(n)    : 向堆（heap）申请至少 n 字节，返回起始地址（void *）
+                 失败返回 NULL
+  free(p)      : 必须成对释放，否则泄漏
+
+  堆上的对象活到 free 为止，可以安全从函数里把指针返回去：
+
+      int *p = malloc(sizeof(int));
+      if (p == NULL) return NULL;
+      *p = 11;
+      return p;          // OK，这是堆地址
+      // 调用方用完 free(p)
+
+  口诀
+      &z        拿已有变量的地址（变量必须还活着）
+      malloc    新造一块堆内存，拿到地址（活到 free）
+      *p        顺着地址读写内容
+
+
+============================================================
+2. 用户态为什么看到的都是虚拟地址
+============================================================
+
+用户程序里的 &z、malloc 返回值、数组下标，全是虚拟地址 VA
+（virtual address），不是物理内存条上的 PA（physical address）。
+
+访存路径：
+  用户指令里的 VA
+      → MMU 查页表 page table
+      → PA
+      → RAM
+
+原因（virtualization + 隔离）：
+  1) Isolation   用户不能任意写别人的内存或内核
+  2) 私有地址空间 同一程序跑两份，&local 可以打印相同数字，
+                 但映射到不同物理页，值各自涨
+  3) 内核可在底下搬迁/共享/换页，用户无感
+                 fork 的 COW、共享 libc 只读页、缺页再配物理页
+
+Matching virtual addresses need not share physical storage.
+相同 VA ≠ 同一块物理内存。
+
+用户态不是「没有物理内存」，而是「不被允许直接命名物理内存」。
+改页表、开关分页是特权操作，只能 kernel mode 做。
+
+
+============================================================
+3. User mode / Kernel mode / Kernel code / Kernel memory
+============================================================
+
+这四个词不是同一层：
+
+  mode         = CPU 此刻的权限开关（硬件状态）
+  kernel code  = 内核的程序文本（软件）
+  kernel memory= 内核占用的内存区域（代码+数据+内核栈+页表等）
+
+3.1 User mode（用户态）
+  跑应用程序。
+  不能执行特权指令（改页表、关中断、直接碰设备）。
+  不能访问 kernel memory。
+  可以：算术、跳转、访问「当前进程页表允许的」虚拟地址。
+  例：total += values[i]; 不必进内核。
+
+3.2 Kernel mode（内核态）
+  跑受信任的 OS 代码。
+  可以控制设备、改页表、调度、处理中断。
+  一次写错可能崩整机。
+  应用程序不能自己把 CPU 切到 kernel mode。
+
+3.3 三种事件才会进内核（trap）
+  System call  应用主动请求服务（write, fork, exec, pipe, wait）
+  Exception    当前指令需要处理（缺页、除零、非法地址）
+  Interrupt    硬件事件（时钟、磁盘完成）
+
+3.4 Kernel code
+  调度器、sys_write、trap handler、驱动……
+  设计上：kernel code 在 kernel mode 下执行。
+  C 里的 write() 只是 libc 包装；真正干活的是内核里的 sys_write。
+
+3.5 Kernel memory
+  内核代码、进程表、页表、打开文件表、内核栈等。
+  用户即使猜到内核虚拟地址，MMU 也会按页表权限拒绝 → page fault
+  → 通常 Segmentation fault 杀掉进程。
+
+对照：
+  用户虚拟地址空间  = 你的代码、堆、栈
+  内核虚拟地址空间  = kernel code + 内核数据 = kernel memory
+  （常映射在每个进程高地址，但标成仅 kernel mode 可访问）
+
+
+============================================================
+4. System call 不是普通函数调用（必考易错）
+============================================================
+
+正确模型：
+  API  名字和参数类型（write(fd, buf, n)）
+  ABI  syscall 号、参数放哪个寄存器、返回值在哪
+  ISA  受控入口指令：syscall / svc / ecall
+
+路径：
+  用户执行 trap 指令
+      → CPU 硬件：存现场、切 kernel mode、跳到预定 handler
+      → 内核校验请求、办事、返回
+      → 特权返回指令（sret/sysret/iret）
+      → CPU 把 mode 改回 user mode
+
+参数在哪：
+  小参数（fd、长度、syscall 号）→ 寄存器
+  缓冲区 → 用户虚拟地址（user memory 指针）
+  内核必须校验 + copy_from_user / copy_to_user
+  用户绝不能「准备一块 kernel memory 再把指针递进去」
+
+【错句 (2)】
+  "A system call is simply an ordinary function call into kernel code,
+   so its arguments must be passed by a pointer to kernel memory."
+  错因：
+    - 不是普通 call，不能跳到内核任意地址，只能进 approved entry point
+    - 参数不是指向 kernel memory 的指针，而是寄存器 + 用户指针
+
+【错句 (3)】
+  "The kernel changes the mode bit when a system call is executed,
+   transferring control from user mode to kernel mode."
+  错因：
+    - 从 user→kernel 改 mode bit 的是 CPU 硬件，不是内核软件
+    - 执行 syscall 那一瞬间还在 user mode，内核代码还没跑
+    - 用户态没有权限自己拨高 mode bit，否则谁都能提权
+    - 内核可以在已经处于 kernel mode 时，用返回指令让 CPU 降权
+
+讲义原话：
+  CPU pauses the current code, enters kernel mode, and starts the handler.
+  A system call transfers control to an approved kernel entry point.
+
+
+============================================================
+5. 进程相关系统调用与命令
+============================================================
+
+5.1 fork()
+  克隆当前进程。
+  返回值：
+    父进程：孩子的 PID（>0）
+    子进程：0
+    失败：-1
+  调用瞬间还是 1 个进程；返回后已经是 2 个。
+  if (fork() == 0) 是「先 fork，再各自用返回值判断」，不是先判断再分裂。
+  父子谁先被调度：不确定。不要假设父一定先跑。
+  各自有一份独立的栈/堆/变量副本（写时才真正分开，课上后面会讲 COW）。
+
+5.2 exec 家族（execl / execv / execlp / execve …）
+  用新程序替换当前进程镜像。PID 不变，代码/数据/堆栈全换。
+  成功：不返回
+  失败：返回 -1
+
+  execl(path, arg0, arg1, ..., NULL)
+    l = list，参数一个个列出来，必须以 NULL 结尾
+    第一个参数：磁盘上的可执行文件路径
+    后面：新程序的 argv[]
+    argv[0] 习惯上写程序名
+
+  例：
+    execl("./a.out", "./a.out", NULL);
+    加载当前目录的 a.out，新程序看到 argv[0]="./a.out"
+
+  a.out
+    Unix 编译器默认输出名，来自 assembler output。
+    .out 不是语法，只是文件名。gcc hello.c 不写 -o 就生成 a.out。
+
+  典型组合（shell 跑命令）：
+    if (fork() == 0) {
+        execl("/bin/ls", "ls", NULL);
+        perror("execl");
+        exit(1);
+    }
+
+5.3 ls
+  list：列出目录里的文件。本身是普通用户程序，通常 /bin/ls。
+  跑完就 exit，不会无限繁殖。
+  xv6 的 $ ls 同理，列出 mkfs 放进初始文件系统的那些程序。
+
+5.4 getpid() / getppid()
+  getpid()  : 当前进程自己的 PID
+  getppid() : 父进程的 PID
+
+  pid_t parent = getpid(); 只是把「此刻自己的号」存进普通变量。
+  fork 之后这个数字会被拷贝给孩子，孩子变量里写的仍是「最初那个进程的号」，
+  不是孩子自己的 PID，也不是 getppid()。
+
+  if (getpid() == parent)  → 只有最初那个进程为真。
+
+5.5 wait / wait(NULL)
+  父进程等待「任意一个」子进程结束（变成僵尸后收尸）。
+  只 wait 一次 ≠ 等所有孩子。
+  wait 返回后，至少一个孩子已经 exit；若孩子 exit 前有 printf，
+  那个字母一定已经出现。
+
+5.6 exit(0)
+  终止当前进程。之后的代码不会跑。
+  子进程里 exit 可避免孩子继续执行父进程后面的 fork/printf。
+
+5.7 sleep(1)
+  当前进程主动休眠约 1 秒，状态变为 Sleeping/Blocked，让出 CPU。
+  底层是系统调用（如 nanosleep），不是用户态空转。
+  课上示例用来减慢打印，方便同时观察两个进程的 local/global。
+
+5.8 pipe / read / write
+
+  int p[2];
+  pipe(p);
+    p[0] 读端  p[1] 写端
+    刚创建时管道为空
+
+  read(p[0], &x, 1)
+    有数据：读走，立即返回
+    空管 + 写端还开着：阻塞，进程睡着，直到有人 write
+
+  write(p[1], "x", 1)
+    往管道投 1 字节，可唤醒正在 read 的进程
+
+  文件描述符约定：
+    0 stdin   1 stdout   2 stderr
+    fd 也可以指向文件、pipe、设备、socket
+
+
+============================================================
+6. 分析 fork 题的固定套路
+============================================================
+
+不要猜调度顺序。列出：
+  1) 会生出几个进程（每个成功 fork 让「执行到这句的进程」各变两个）
+  2) 每个进程会执行哪些语句（exit / exec 会切掉后面的代码）
+  3) 哪些输出有数据依赖（pipe 空 read、wait）
+  4) 变量是每进程一份，不是共享内存（除非 shm，本期对话没有）
+
+常见进程数：
+  n 次不被 exit/exec 剪枝的 fork → 最多 2^n 个进程
+
+exec 成功后：
+  当前进程从新程序的入口（main）重新开始，后面的语句是死代码。
+
+
+============================================================
+7. 对话中的错题 / 例题
+============================================================
+
+------------------------------------------------------------
+题 A. 指针代码（image.png）
+------------------------------------------------------------
+  make() 返回 &z，z 是局部变量。
+  考点：* 与 &；栈生命周期；dangling pointer。
+  正确做法：malloc 一块，写入后再返回堆指针，调用方 free。
+
+------------------------------------------------------------
+题 B. 两个关于 syscall 的判断句
+------------------------------------------------------------
+  (2) syscall = 普通函数调用，参数必须是指向 kernel memory 的指针
+      → 错（见第 4 节）
+  (3) 内核在执行 syscall 时改 mode bit，从而从 user 切到 kernel
+      → 错（硬件改；否则无法从 user 提权）
+
+------------------------------------------------------------
+题 C. Question 8  fork + wait + 打印 B/C/A
+------------------------------------------------------------
+  if (fork()==0) { printf("B"); exit(0); }
+  if (fork()==0) { printf("C"); exit(0); }
+  wait(NULL);
+  printf("A");
+
+  进程：
+    P0 原进程：两次 fork 都走「非 0」分支，wait 一次，再打印 A
+    P1 第一次 fork 的孩子：只打印 B 然后 exit（不做第二次 fork）
+    P2 第二次 fork 的孩子：只打印 C 然后 exit
+
+  约束：
+    A 不可能第一个：wait 返回前至少有一个孩子已经打印并 exit
+    wait 只等一个孩子，所以 A 也可以夹在 B 和 C 中间
+    两个孩子都跑完再 wait，则 B 和 C 都在 A 前
+
+  可能：CAB, BCA, BAC, CBA
+  不可能：ABC, ACB（A 打头）
+
+  答案：B. ABC cannot occur
+  易错：以为父一定先跑；或以为 wait 会等两个孩子。
+
+------------------------------------------------------------
+题 D. fork + execl("./a.out") + fork，跑一段时间有多少进程
+------------------------------------------------------------
+  int main(void) {
+      fork();
+      execl("./a.out", "./a.out", NULL);  // 总是成功
+      fork();   // 死代码
+      return 0;
+  }
+
+  有效逻辑 = 每次进入 main 都 fork，然后父子都 exec 回自己的 main。
+  1 → fork 成 2 → 都从 main 再来 → fork 成 4 → 8 → …
+  无限指数增长（题目假设 fork/execl 总成功）。
+
+  易错：
+    - 以为 execl 会再开一个进程（不，PID 不变，只换镜像）
+    - 以为第二句 fork 会执行（execl 成功不返回）
+    - 以为答案是 2 或 3
+
+  对比：execl("/bin/ls") 会结束，因为 ls 不会再 exec 自己。
+
+------------------------------------------------------------
+题 E. getpid 过滤后只打印 p
+------------------------------------------------------------
+  int p = 0;
+  pid_t parent = getpid();
+  fork();
+  p++;
+  fork();
+  p++;
+  if (getpid() == parent)
+      printf("%d\n", p);
+
+  四个进程各有一份 p。
+  只有原进程 getpid()==parent，它的 p 经过两次 ++ 变成 2。
+  输出确定为 2，与调度无关。
+
+  答案：B. 2
+  易错：把 parent 变量当成 getppid()；以为 p 是共享的会加到 4/6；
+        以为输出不确定。
+
+------------------------------------------------------------
+题 F. Question 13  pipe + fork，输出排除换行后是什么
+------------------------------------------------------------
+  pipe(p);
+  if (fork()==0) {
+      read(p[0], &x, 1);
+      printf("B\n");
+      exit(0);
+  }
+  printf("A\n");
+  write(p[1], "x", 1);
+  wait(NULL);
+  printf("C\n");
+
+  happens-before：
+    父 printf A
+        → 父 write
+            → 子 read 返回
+                → 子 printf B → exit
+                    → 父 wait 返回
+                        → 父 printf C
+
+  子进程即使先被调度，也会在空管道的 read 上睡着，打不出 B。
+  只有 ABC。
+
+  答案：B. ABC
+  BAC/BCA/ACB 都违反上面的链。
+
+
+============================================================
+8. 专有名词与缩写表
+============================================================
+
+OS            Operating System 操作系统
+xv6           教学用 Unix 再实现（本课作业平台）
+QEMU          模拟器，用来跑 xv6
+ISA           Instruction Set Architecture 指令集
+API           Application Programming Interface
+ABI           Application Binary Interface
+PID           Process ID
+PC            Program Counter 程序计数器
+VA / PA       Virtual Address / Physical Address
+MMU           Memory Management Unit 把 VA 译成 PA
+Page table    页表，内核维护、硬件查阅的映射表
+TLB           Translation Lookaside Buffer（后面页表讲座会用）
+COW           Copy-On-Write 写时复制（fork 后常见）
+syscall       系统调用
+trap          总称：syscall / exception / interrupt 把控制交给内核
+exception     异常（当前指令引发，如 page fault、除零）
+interrupt     中断（设备/时钟等外部事件）
+page fault    缺页异常
+mode bit      描述 CPU 处于 user/kernel 的状态位（教材简化说法）
+CPL / ring    x86 特权级；user≈ring 3，kernel≈ring 0
+kernel        内核：管理 CPU/内存/设备、强制隔离的特权软件
+monolithic    宏内核：调度、VM、驱动、FS 都在内核空间
+microkernel   微内核：特权核心很小，很多服务在用户空间用消息通信
+user space    用户空间
+kernel space  内核空间
+heap          堆，malloc/free
+stack         栈，局部变量、返回地址
+dangling ptr  悬空指针，指向已失效存储
+UB            Undefined Behaviour 未定义行为
+fd            file descriptor 文件描述符
+stdin/out/err 标准输入/输出/错误，fd 0/1/2
+pipe          管道，一对 fd，用于进程间字节流
+blocking      阻塞：等事件时睡觉，不占 CPU
+ready/running/sleeping  就绪 / 正在跑 / 睡眠（等 I/O 或 sleep）
+zombie        僵尸进程：已 exit，等父进程 wait 收尸
+scheduler     调度器
+context switch上下文切换
+libc          C 标准库（write 等函数的用户态包装）
+a.out         默认可执行文件名
+ls            list 目录内容的用户程序
+sh            shell
+mkfs          做初始文件系统的工具（xv6 启动后 ls 看到的那些文件）
+FlexIT        学校远程 Ubuntu 环境
+hart          RISC-V 硬件线程（xv6 启动信息里的 hart 1 starting）
+
+C 相关
+  fork / exec / execl / wait / exit / pipe / read / write
+  getpid / getppid / sleep / malloc / free / sizeof
+  printf / perror
+  NULL        空指针，execl 参数列表结束标记
+  pid_t       PID 的类型
+
+作业相关（A1）
+  Part 1  xv6 基础：用户程序 touch、进程、pipe、简单 syscall
+  Part 2  优先级调度器
+  C 版仓库  xv6-c-student      构建：make qemu
+  Rust 版   xv6-rust-student   构建：cargo run --release
+  必须全程只用一种语言
+  退出 QEMU：Ctrl-a 然后 x
+  xv6 无 ps：C 版可用 Ctrl-p 打印进程
+
+
+============================================================
+9. 口诀（考场用）
+============================================================
+
+指针
+  声明里的 * 是「这是指针」；表达式里的 * 是「取出内容」。
+  & 永远是「取地址」。
+
+内存
+  局部变量跟函数死；堆内存跟 free 死；用户只看见 VA。
+
+模式
+  mode 是开关，code 是程序，memory 是地盘。
+  用户不能自己拨开关，也不能踩内核地盘。
+
+syscall
+  不是 call 进内核，是 trap 进固定大门。
+  提权靠 CPU，不靠内核先改 bit。
+  缓冲区指针指向用户空间，内核再拷。
+
+fork
+  先克隆再看返回值。
+  0 是孩子，非 0 是父亲。
+  谁先跑看调度；有 pipe/wait 才有确定顺序。
+
+exec
+  换灵魂不换身份证（PID 不变）。
+  成功不回来；exec 自己 + 开头再 fork = 无限涨。
+
+pipe
+  空管 read 必睡；write 才能醒。
+  用数据依赖锁输出顺序，不要赌调度。
+
+wait
+  一次只收一个孩子。
+  A 若在 wait 之后，A 不能排第一，但可以不是最后。
+
+
+============================================================
+10. 和作业 / 后续讲座的衔接（知道即可）
+============================================================
+
+A1 Task 1 touch
+  用户态程序：缺参数要报错；用 open 创建文件；加进 Makefile / Cargo.toml。
+
+后面会用到、对话里只碰到边的词：
+  调度（lecture 7–8）、单级/多级页表（9–10）、
+  置换（11）、分配器与 malloc 内核实现（12）。
+  用户态 malloc 最终仍通过 syscall 向内核要虚拟内存，缺页时再配物理页。
+
+============================================================
+完
+============================================================
